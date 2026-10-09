@@ -59,8 +59,9 @@ accepted*, open the dashboard, AI, Models, open that model, and agree.
 Open the Worker's URL. You land on the welcome page ("What can I help
 with?"); opening the site never opens an old chat and never creates one. Pick
 a conversation in the sidebar to continue it, or just type: the first message
-automatically creates a conversation called "New Chat". Press Enter to send
-(Shift+Enter for a new line).
+automatically creates a conversation called "New Chat". On a computer, Enter
+sends and Shift+Enter adds a new line. On a phone or tablet, Enter adds a new
+line and the Send button sends.
 
 | Control | What it does |
 |---|---|
@@ -69,7 +70,7 @@ automatically creates a conversation called "New Chat". Press Enter to send
 | Lightbulb | Asks the model to reason first. Shows as a collapsible "Thought process" above the answer. |
 | Circular arrow on a reply | Regenerate. Adds a new version; the old one is kept. |
 | `<` `>` and counter | Switch between versions of a reply. |
-| Sidebar | Create, rename, delete and switch conversations. |
+| Sidebar | Create, rename (pencil icon), delete (cross icon) and switch conversations. |
 
 **Versions:** sending a message after switching to an older version continues
 from that version, the same as claude.ai.
@@ -112,6 +113,9 @@ summary does not yet cover is sent verbatim, so no message falls into a gap.
   child is followed instead of cutting the conversation off.
 - The neuron count comes from the model's usage report when it has one,
   otherwise from an estimate.
+- Sources appear once: any "Sources" or "References" list the model writes
+  itself is removed before the real list is appended, and the stored list is
+  removed from history so the model does not copy it next time.
 - Search results are used for that one call only and never stored. Each
   snippet is capped at 600 characters and the model is told to treat results
   as untrusted.
@@ -119,10 +123,23 @@ summary does not yet cover is sent verbatim, so no message falls into a gap.
   events ("Searching the web...", "Thinking..."), then one result. The reply
   itself is not token-streamed; it arrives whole.
 
-**Client side (embedded UI).** A small markdown renderer (headings, lists,
-tables, links, code blocks), the version navigator, the model, search and
+**Client side (embedded UI).** A markdown renderer written to cope with the
+different styles the models use: headings (`#` and underlined), bold, italic,
+bold-italic, strikethrough, highlight, inline code, links, bare URLs, nested
+bullet and numbered lists, task lists, tables with alignment (they scroll
+sideways on phones), blockquotes, horizontal rules, fenced code with ``` or
+~~~ (including unclosed ones), a few safe inline tags (`<br>`, `<sub>`,
+`<sup>`, `<kbd>`), and backslash escapes. Everything else is shown as plain
+text, never as live HTML. LaTeX is shown as code, not typeset. Reasoning
+blocks written as `<thinking>` or `<think>` become the collapsible "Thought
+process". The UI also has the version navigator, the model, search and
 thinking toggles, theme saved in `localStorage`, and swipe gestures for the
-sidebar on phones. A failed send restores what you typed and reloads the
+sidebar on phones.
+
+**Phones.** Larger text and touch targets, safe-area padding for notches, a
+two-row input bar (model and toggles above, message and Send below), the
+layout follows the on-screen keyboard, the keyboard is not opened
+automatically, and the browser theme colour follows light/dark. A failed send restores what you typed and reloads the
 conversation, so no phantom message is left behind. Code blocks cut off by the
 token limit are still shown.
 
@@ -176,10 +193,15 @@ offers a model the server rejects.
 7. Lightbulb on: a "Thought process" block appears above the answer.
 8. Regenerate that reply with the lightbulb off: the old "Thought process"
    block disappears at once and the new reply has none.
-9. Globe on with a key set: a Sources list is appended. Without a key: an error
-   toast explains how to add one.
+9. Globe on with a key set: one Sources list is appended (not two). Without a
+   key: an error toast explains how to add one.
 10. Remove the `AI` or `DB` binding temporarily: you get a clear error, not a
-   blank page.
+    blank page.
+11. Click the pencil icon on a conversation: a "Rename Chat" box opens with the
+    current name filled in and a "Rename" button.
+12. On a phone: the keyboard does not open by itself, the input bar stays above
+    the keyboard, Enter adds a line, tables scroll sideways, and nothing is
+    hidden under a notch.
 
 ---
 
