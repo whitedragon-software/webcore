@@ -127,8 +127,8 @@ summary does not yet cover is sent verbatim, so no message falls into a gap.
 different styles the models use: headings (`#` and underlined), bold, italic,
 bold-italic, strikethrough, highlight, inline code, links, bare URLs, nested
 bullet and numbered lists, task lists, tables with alignment (they scroll
-sideways on phones), blockquotes, horizontal rules, fenced code with ``` or
-~~~ (including unclosed ones), a few safe inline tags (`<br>`, `<sub>`,
+sideways on phones), blockquotes, horizontal rules, fenced code (triple
+backtick or tilde, including unclosed blocks), a few safe inline tags (`<br>`, `<sub>`,
 `<sup>`, `<kbd>`), and backslash escapes. Everything else is shown as plain
 text, never as live HTML. LaTeX is shown as code, not typeset. Reasoning
 blocks written as `<thinking>` or `<think>` become the collapsible "Thought
@@ -182,19 +182,19 @@ offers a model the server rejects.
 ## Quick test checklist
 
 1. Homepage opens on the welcome page ("What can I help with?"), not on an old
-   chat, and the sidebar neuron bar fills in.
+    chat, and the sidebar neuron bar fills in.
 2. Send a message: a conversation called "New Chat" is created and the reply
-   appears.
+    appears.
 3. Reload: the conversation and reply are still there.
 4. Regenerate: a `2/2` counter appears and `<` returns to the original.
 5. Switch to version 1 and send another message: it continues from version 1.
 6. Ask for a long HTML page: a Code / Preview block appears even if the reply
-   hit the token limit.
+    hit the token limit.
 7. Lightbulb on: a "Thought process" block appears above the answer.
 8. Regenerate that reply with the lightbulb off: the old "Thought process"
-   block disappears at once and the new reply has none.
+    block disappears at once and the new reply has none.
 9. Globe on with a key set: one Sources list is appended (not two). Without a
-   key: an error toast explains how to add one.
+    key: an error toast explains how to add one.
 10. Remove the `AI` or `DB` binding temporarily: you get a clear error, not a
     blank page.
 11. Click the pencil icon on a conversation: a "Rename Chat" box opens with the
