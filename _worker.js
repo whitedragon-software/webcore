@@ -16,7 +16,6 @@ var CONFIG = {
   TEMPERATURE: 0.7,
   MAX_TOKENS: 1000,
   MAX_PROMPT_LENGTH: 2000,
-  MAX_HISTORY: 20,
   DAILY_NEURON_LIMIT: 10000,
   CORS_ORIGIN: '*',
   MAX_SEARCH_RESULTS: 5,
@@ -316,7 +315,9 @@ async function runDatabaseInit(env) {
   await addColumnIfMissing(env, 'conversations', 'memory_covered_count', 'memory_covered_count INTEGER DEFAULT 0');
   await env.DB.batch([
     env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id)'),
-    env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_messages_parent_id ON messages(parent_id)')
+    env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_messages_parent_id ON messages(parent_id)'),
+    // Speeds up the sidebar's "ORDER BY updated_at DESC" as conversations grow.
+    env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_conversations_updated_at ON conversations(updated_at DESC)')
   ]);
   return true;
 }
@@ -402,6 +403,73 @@ async function getTodayUsage(env, today) {
   var stmt = env.DB.prepare('SELECT used FROM neuron_usage WHERE date = ?');
   var result = await stmt.bind(today).first();
   return result ? result.used : 0;
+}
+
+// Small shared statement builders — used by both /api/chat and
+// /api/regenerate, so the SQL for each kind of write is written once.
+function insertMessageStmt(env, conversationId, parentId, role, content, ts) {
+  return env.DB.prepare(
+    'INSERT INTO messages (conversation_id, parent_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)'
+  ).bind(conversationId, parentId, role, content, ts);
+}
+
+function setActiveChildStmt(env, parentId, childId) {
+  return env.DB.prepare('UPDATE messages SET active_child_id = ? WHERE id = ?').bind(childId, parentId);
+}
+
+function bumpNeuronUsageStmt(env, today, neurons) {
+  return env.DB.prepare(
+    'INSERT INTO neuron_usage (date, used) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET used = used + ?'
+  ).bind(today, neurons, neurons);
+}
+
+function touchConversationStmt(env, conversationId, now) {
+  return env.DB.prepare('UPDATE conversations SET updated_at = ? WHERE id = ?').bind(now, conversationId);
+}
+
+// Resolves to the conversation row (or undefined) — unlike the other *Stmt
+// helpers, this one already runs the query rather than returning a
+// Statement, so it can go straight into a Promise.all.
+function conversationExists(env, conversationId) {
+  return env.DB.prepare('SELECT id FROM conversations WHERE id = ?').bind(conversationId).first();
+}
+
+// Runs a web search (if requested) and today's neuron usage lookup at the
+// same time — neither depends on the other, and search can take up to
+// SEARCH_TIMEOUT_MS, so overlapping it with the D1 read instead of doing
+// them one after another saves real wall-clock time on every request.
+async function fetchSearchAndUsage(env, send, wantsSearch, query) {
+  var today = new Date().toISOString().split('T')[0];
+  if (wantsSearch) await send({ type: 'status', stage: 'searching' });
+  var searchPromise = wantsSearch ? webSearch(env, query) : Promise.resolve({ results: [], error: null });
+  var usagePromise = getTodayUsage(env, today);
+  var pair = await Promise.all([searchPromise, usagePromise]);
+  var searchResult = pair[0];
+  var currentUsage = pair[1];
+  var searchResults = searchResult.results.length ? searchResult.results : [];
+  return {
+    today: today,
+    currentUsage: currentUsage,
+    searchResults: searchResults,
+    searchContextMessage: searchResults.length ? buildSearchContextMessage(query, searchResults) : null,
+    searchError: searchResult.error
+  };
+}
+
+// Puts the standing system instructions in front of the conversation
+// context, in the same order both endpoints used to build them by hand.
+function prependSystemMessages(contextMessages, searchContextMessage, wantsThinking) {
+  if (searchContextMessage) contextMessages.unshift(searchContextMessage);
+  if (wantsThinking) contextMessages.unshift(buildThinkingInstructionMessage());
+  contextMessages.unshift(buildCodeOutputInstructionMessage());
+  return contextMessages;
+}
+
+async function generateReply(env, send, resolved, contextMessages, temperature, max_tokens, estimatedNeurons, searchResults) {
+  await send({ type: 'status', stage: 'generating', model: resolved.model });
+  var aiResult = await runAIModel(env, resolved.model, contextMessages, temperature, max_tokens, estimatedNeurons);
+  aiResult.resultText = appendSources(aiResult.resultText, searchResults);
+  return aiResult;
 }
 
 function assertWithinNeuronBudget(currentUsage, estimated) {
@@ -874,11 +942,15 @@ function pathToNode(tree, nodeId) {
 }
 
 async function buildConversationPayload(env, conversationId) {
-  var convStmt = env.DB.prepare('SELECT * FROM conversations WHERE id = ?');
-  var conv = await convStmt.bind(conversationId).first();
+  // The conversation row and its message tree don't depend on each other,
+  // so fetch both at once instead of one after the other.
+  var pair = await Promise.all([
+    env.DB.prepare('SELECT id, title FROM conversations WHERE id = ?').bind(conversationId).first(),
+    loadConversationTree(env, conversationId)
+  ]);
+  var conv = pair[0];
   if (!conv) return null;
-  var tree = await loadConversationTree(env, conversationId);
-  var messages = getActivePath(tree);
+  var messages = getActivePath(pair[1]);
   return { success: true, id: conv.id, title: conv.title, messages: messages };
 }
 
@@ -1029,11 +1101,14 @@ export default {
           return jsonResponse({ success: false, error: 'This message has no alternate versions' }, 400);
         }
 
-        var updateStmt = env.DB.prepare('UPDATE messages SET active_child_id = ? WHERE id = ?');
-        await updateStmt.bind(target.id, target.parent_id).run();
+        await setActiveChildStmt(env, target.parent_id, target.id).run();
 
-        var payload = await buildConversationPayload(env, conversationId);
-        return jsonResponse(payload);
+        // The tree is already in memory and only one pointer changed, so
+        // patch it here instead of re-querying the whole conversation.
+        tree.byId[target.parent_id].active_child_id = target.id;
+        var conv = await env.DB.prepare('SELECT id, title FROM conversations WHERE id = ?').bind(conversationId).first();
+        if (!conv) return jsonResponse({ success: false, error: 'Conversation not found' }, 404);
+        return jsonResponse({ success: true, id: conv.id, title: conv.title, messages: getActivePath(tree) });
       } catch (err) {
         return jsonResponse({ success: false, error: err.message }, 500);
       }
@@ -1067,31 +1142,27 @@ export default {
         var wantsSearch = !!body.web_search;
         var wantsThinking = !!body.thinking;
 
-        var convCheck = env.DB.prepare('SELECT id FROM conversations WHERE id = ?');
-        var convExists = await convCheck.bind(conversationId).first();
+        // Conversation lookup, the message tree, any web search, and
+        // today's neuron usage are all independent of each other, so they
+        // run together instead of one after another. Search can take up to
+        // SEARCH_TIMEOUT_MS, so overlapping it with the D1 reads (instead of
+        // doing it first, as before) is the single biggest latency saving
+        // here.
+        var convTreePromise = Promise.all([conversationExists(env, conversationId), loadConversationTree(env, conversationId)]);
+        var searchUsagePromise = fetchSearchAndUsage(env, send, wantsSearch, prompt);
+        var convTreeResult = await convTreePromise;
+        var convExists = convTreeResult[0];
+        var tree = convTreeResult[1];
         if (!convExists) {
+          await searchUsagePromise; // let it finish so ctx.waitUntil has nothing left dangling
           return send({ type: 'result', success: false, error: 'Conversation not found' });
         }
+        var su = await searchUsagePromise;
 
-        var searchContextMessage = null;
-        var searchResults = [];
-        var searchError = null;
-        if (wantsSearch) {
-          await send({ type: 'status', stage: 'searching' });
-          var searchResult = await webSearch(env, prompt);
-          searchError = searchResult.error;
-          if (searchResult.results.length) {
-            searchResults = searchResult.results;
-            searchContextMessage = buildSearchContextMessage(prompt, searchResults);
-          }
-        }
-
-        var today = new Date().toISOString().split('T')[0];
-        var currentUsage = await getTodayUsage(env, today);
-        var extraContextLength = searchContextMessage ? searchContextMessage.content.length : 0;
+        var extraContextLength = su.searchContextMessage ? su.searchContextMessage.content.length : 0;
         var estimatedNeurons = estimateNeurons(prompt.length + extraContextLength, max_tokens);
         try {
-          assertWithinNeuronBudget(currentUsage, estimatedNeurons);
+          assertWithinNeuronBudget(su.currentUsage, estimatedNeurons);
         } catch (err) {
           return send({ type: 'result', success: false, error: err.message });
         }
@@ -1100,7 +1171,6 @@ export default {
         // currently displayed (the active leaf), so sending a message after
         // switching to an older branch continues *that* branch — matching
         // claude.ai's behavior.
-        var tree = await loadConversationTree(env, conversationId);
         var activePath = getActivePath(tree);
         var parentId = activePath.length ? activePath[activePath.length - 1].id : null;
 
@@ -1110,21 +1180,14 @@ export default {
         // The search context is only ever sent to the model for this one
         // call — it's never stored, so a conversation never carries stale
         // search results forward into later turns.
-        if (searchContextMessage) contextMessages.unshift(searchContextMessage);
-        if (wantsThinking) contextMessages.unshift(buildThinkingInstructionMessage());
-        contextMessages.unshift(buildCodeOutputInstructionMessage());
+        prependSystemMessages(contextMessages, su.searchContextMessage, wantsThinking);
 
-        await send({ type: 'status', stage: 'generating', model: resolved.model });
-        var aiResult = await runAIModel(env, resolved.model, contextMessages, temperature, max_tokens, estimatedNeurons);
-        aiResult.resultText = appendSources(aiResult.resultText, searchResults);
+        var aiResult = await generateReply(env, send, resolved, contextMessages, temperature, max_tokens, estimatedNeurons, su.searchResults);
 
         var now = Date.now();
-        var insertStmt = env.DB.prepare(
-          'INSERT INTO messages (conversation_id, parent_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)'
-        );
         // The user row has to be inserted (and its id known) before the
         // assistant row can reference it as a parent.
-        var userInsert = await insertStmt.bind(conversationId, parentId, 'user', prompt, now).run();
+        var userInsert = await insertMessageStmt(env, conversationId, parentId, 'user', prompt, now).run();
         var userMessageId = userInsert.meta.last_row_id;
 
         // Everything that depends on userMessageId goes in one batch: the
@@ -1132,22 +1195,20 @@ export default {
         // bumping the conversation's updated_at — one round trip instead
         // of several sequential ones.
         var chatBatchStmts = [
-          insertStmt.bind(conversationId, userMessageId, 'assistant', aiResult.resultText, now + 1),
-          env.DB.prepare('UPDATE conversations SET updated_at = ? WHERE id = ?').bind(now, conversationId)
+          insertMessageStmt(env, conversationId, userMessageId, 'assistant', aiResult.resultText, now + 1),
+          touchConversationStmt(env, conversationId, now)
         ];
-        if (parentId) {
-          chatBatchStmts.push(env.DB.prepare('UPDATE messages SET active_child_id = ? WHERE id = ?').bind(userMessageId, parentId));
-        }
+        if (parentId) chatBatchStmts.push(setActiveChildStmt(env, parentId, userMessageId));
         var chatBatchResults = await env.DB.batch(chatBatchStmts);
         var assistantMessageId = chatBatchResults[0].meta.last_row_id;
 
         // Final batch: link the user message to its new assistant child and
         // record neuron usage together, again as one round trip.
         await env.DB.batch([
-          env.DB.prepare('UPDATE messages SET active_child_id = ? WHERE id = ?').bind(assistantMessageId, userMessageId),
-          env.DB.prepare('INSERT INTO neuron_usage (date, used) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET used = used + ?').bind(today, aiResult.neuronsUsed, aiResult.neuronsUsed)
+          setActiveChildStmt(env, userMessageId, assistantMessageId),
+          bumpNeuronUsageStmt(env, su.today, aiResult.neuronsUsed)
         ]);
-        var newUsage = currentUsage + aiResult.neuronsUsed;
+        var newUsage = su.currentUsage + aiResult.neuronsUsed;
 
         // Build the updated display path in-memory — we already know
         // exactly what was just added, so there's no need to re-query the
@@ -1164,7 +1225,7 @@ export default {
           neurons_used: aiResult.neuronsUsed,
           total_neurons_used: newUsage,
           remaining_neurons: CONFIG.DAILY_NEURON_LIMIT - newUsage,
-          search_error: wantsSearch ? searchError : null
+          search_error: wantsSearch ? su.searchError : null
         });
       }, ctx);
     }
@@ -1194,13 +1255,15 @@ export default {
         var wantsSearch = !!body.web_search;
         var wantsThinking = !!body.thinking;
 
-        var convCheck = env.DB.prepare('SELECT id FROM conversations WHERE id = ?');
-        var convExists = await convCheck.bind(conversationId).first();
+        // Conversation lookup and the message tree are independent, so they
+        // run together instead of one after another.
+        var convTreeResult = await Promise.all([conversationExists(env, conversationId), loadConversationTree(env, conversationId)]);
+        var convExists = convTreeResult[0];
+        var tree = convTreeResult[1];
         if (!convExists) {
           return send({ type: 'result', success: false, error: 'Conversation not found' });
         }
 
-        var tree = await loadConversationTree(env, conversationId);
         var target = tree.byId[messageId];
         if (!target) {
           return send({ type: 'result', success: false, error: 'Message not found in this conversation' });
@@ -1221,52 +1284,36 @@ export default {
         }
         var promptForEstimate = ancestors[ancestors.length - 1].content || '';
 
-        var searchContextMessage = null;
-        var searchResults = [];
-        var searchError = null;
-        if (wantsSearch) {
-          await send({ type: 'status', stage: 'searching' });
-          var searchResult = await webSearch(env, promptForEstimate);
-          searchError = searchResult.error;
-          if (searchResult.results.length) {
-            searchResults = searchResult.results;
-            searchContextMessage = buildSearchContextMessage(promptForEstimate, searchResults);
-          }
-        }
+        // The search query depends on the ancestor lookup above, but the
+        // search itself and today's neuron usage don't depend on each
+        // other, so those two run together.
+        var su = await fetchSearchAndUsage(env, send, wantsSearch, promptForEstimate);
 
-        var today = new Date().toISOString().split('T')[0];
-        var currentUsage = await getTodayUsage(env, today);
-        var extraContextLength = searchContextMessage ? searchContextMessage.content.length : 0;
+        var extraContextLength = su.searchContextMessage ? su.searchContextMessage.content.length : 0;
         var estimatedNeurons = estimateNeurons(promptForEstimate.length + extraContextLength, max_tokens);
         try {
-          assertWithinNeuronBudget(currentUsage, estimatedNeurons);
+          assertWithinNeuronBudget(su.currentUsage, estimatedNeurons);
         } catch (err) {
           return send({ type: 'result', success: false, error: err.message });
         }
 
         var modelMessages = await buildModelContext(env, conversationId, resolved.model, cleanHistoryForModel(ancestors));
-        if (searchContextMessage) modelMessages.unshift(searchContextMessage);
-        if (wantsThinking) modelMessages.unshift(buildThinkingInstructionMessage());
-        modelMessages.unshift(buildCodeOutputInstructionMessage());
-        await send({ type: 'status', stage: 'generating', model: resolved.model });
-        var aiResult = await runAIModel(env, resolved.model, modelMessages, temperature, max_tokens, estimatedNeurons);
-        aiResult.resultText = appendSources(aiResult.resultText, searchResults);
+        prependSystemMessages(modelMessages, su.searchContextMessage, wantsThinking);
+        var aiResult = await generateReply(env, send, resolved, modelMessages, temperature, max_tokens, estimatedNeurons, su.searchResults);
 
         // Insert the regenerated response as a NEW sibling under the same
         // parent — the original message (and anything downstream of it) is
         // left untouched and stays reachable by switching branches back.
         var now = Date.now();
-        var insertResult = await env.DB.prepare(
-          'INSERT INTO messages (conversation_id, parent_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)'
-        ).bind(conversationId, target.parent_id, 'assistant', aiResult.resultText, now).run();
+        var insertResult = await insertMessageStmt(env, conversationId, target.parent_id, 'assistant', aiResult.resultText, now).run();
         var newMessageId = insertResult.meta.last_row_id;
 
         await env.DB.batch([
-          env.DB.prepare('UPDATE messages SET active_child_id = ? WHERE id = ?').bind(newMessageId, target.parent_id),
-          env.DB.prepare('UPDATE conversations SET updated_at = ? WHERE id = ?').bind(now, conversationId),
-          env.DB.prepare('INSERT INTO neuron_usage (date, used) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET used = used + ?').bind(today, aiResult.neuronsUsed, aiResult.neuronsUsed)
+          setActiveChildStmt(env, target.parent_id, newMessageId),
+          touchConversationStmt(env, conversationId, now),
+          bumpNeuronUsageStmt(env, su.today, aiResult.neuronsUsed)
         ]);
-        var newUsage = currentUsage + aiResult.neuronsUsed;
+        var newUsage = su.currentUsage + aiResult.neuronsUsed;
 
         // Build the updated display path in-memory: the ancestor chain up
         // to (and including) the parent hasn't changed, so we only need to
@@ -1294,7 +1341,7 @@ export default {
           neurons_used: aiResult.neuronsUsed,
           total_neurons_used: newUsage,
           remaining_neurons: CONFIG.DAILY_NEURON_LIMIT - newUsage,
-          search_error: wantsSearch ? searchError : null
+          search_error: wantsSearch ? su.searchError : null
         });
       }, ctx);
     }
